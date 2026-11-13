@@ -64,17 +64,29 @@ class InspirationService:
         })
 
     async def _collect_external(self,now:Any)->int:
-        """限频调用授权插件 API，只提取有限文字并将外部来源固定为私人灵感。"""
+        """限频读取插件素材或已联网获取的公开新闻，外部灵感和批注都保留为私人。"""
         cfg=self.config.creation; api_name=str(cfg.external_reading_api_name or "").strip()
-        if not cfg.external_reading_enabled or not api_name or not cfg.plaintext_storage_acknowledged:return 0
+        if not cfg.external_reading_enabled or not cfg.plaintext_storage_acknowledged:return 0
+        if not api_name and not (self.config.network.enabled and self.config.network.news_enabled):return 0
         if now.timestamp()-self._last_external_attempt<int(cfg.patrol_interval_minutes)*60:return 0
         self._last_external_attempt=now.timestamp()
-        try:result=await self.ctx.api.call(api_name,limit=int(cfg.external_reading_max_items))
-        except Exception as exc:
-            self.logger.info(f"[MaiLife] 外部阅读插件 API 暂不可用: {str(exc)[:180]}"); return 0
-        items=result.get("items",[]) if isinstance(result,dict) else result if isinstance(result,list) else []
+        limit=int(cfg.external_reading_max_items)
+        if api_name:
+            try:result=await self.ctx.api.call(api_name,limit=limit)
+            except Exception as exc:
+                self.logger.info(f"[MaiLife] 外部阅读插件 API 暂不可用: {str(exc)[:180]}"); return 0
+            if isinstance(result,dict) and "result" in result:result=result["result"]
+            items=result.get("items",[]) if isinstance(result,dict) else result
+            if isinstance(items,list):items=items[:limit]
+        else:
+            api_name="mai_life.public_news"
+            news=await self.store.recent_news_items(now.timestamp(),limit=max(5,limit))
+            items=[{"id":item["id"],"title":item["title"],"text":item["content"] or item["summary"]}
+                   for item in news if str(item.get("url") or "").startswith(("https://","http://"))]
+        if not isinstance(items,list):return 0
         count=0
-        for index,item in enumerate(items[:int(cfg.external_reading_max_items)]):
+        for index,item in enumerate(items):
+            if count>=limit:break
             if not isinstance(item,dict):continue
             external_id=self._external_text(item.get("id"),200) or self._external_text(item.get("url"),200) or str(index)
             title=self._external_text(item.get("title"),160) or "未命名阅读素材"
@@ -84,9 +96,10 @@ class InspirationService:
                 self._external_text(item.get("content"),6000),
             ) if text),"")
             if not source:continue
+            note_id=hashlib.sha256(f"{api_name}:{external_id}".encode()).hexdigest()[:32]
+            if await self.store.has_reading_note(note_id):continue
             digest=hashlib.sha256(f"{api_name}:{external_id}:{source}".encode()).hexdigest()
             annotation=await self._annotate(title,source)
-            note_id=hashlib.sha256(f"{api_name}:{external_id}".encode()).hexdigest()[:32]
             saved=await self.store.save_reading_note({
                 "id":note_id,"source_api":api_name,"external_id":external_id,"title":title,
                 "summary":source[:1200],"annotation":annotation,"source_digest":digest,

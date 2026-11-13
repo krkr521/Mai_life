@@ -10,6 +10,16 @@ from .adapter_compat import component_kind, component_text, walk_components
 
 _URGENT_RE=re.compile(r"急事|紧急|救命|出事了|危险|报警|叫醒|醒醒|快醒|撑不住|自杀|轻生",re.I)
 _QUIET_RE=re.compile(r"别回|不要回|不用回|继续睡|别醒|别打扰|不用理我",re.I)
+_READY_TO_CHAT_RE = re.compile(
+    r"^(?:八千代[，,、\s]*)?(?:我\s*)?"
+    r"(?:(?:(?:已经|终于|刚刚|刚)\s*)?"
+    r"(?:下课|下班|忙完|忙好|散会|开完会|会开完|上完课|课上完|回来|回到家|到家|有空|考完"
+    r"|(?:可以|能)(?:继续)?(?:聊(?:天)?|给我发消息))(?:了|啦|咯|喽)"
+    r"|(?:已经|终于|刚刚|刚)\s*(?:下课|下班|忙完|散会|开完会|上完课|回来|到家|考完)"
+    r"|现在(?:有空|(?:可以|能)(?:继续)?(?:聊(?:天)?|给我发消息))(?:了|啦)?"
+    r"|(?:解除|退出|取消)(?:临时)?(?:免打扰|勿扰)(?:模式)?)"
+    r"(?:呀|哦|哈)?(?:[。！!，,～~]|\s*$)"
+)
 _MEDIA_PLACEHOLDER_RE=re.compile(
     r"\[(?:image|图片|emoji|表情包|表情|voice|语音|video|视频|file|文件|reply|forward|unsupported)\]",
     re.I,
@@ -72,6 +82,11 @@ def media_types(message: dict[str,Any]) -> list[str]:
         if kind not in found and pattern.search(display):found.append(kind)
     if plain_text(message) and "text" not in found:found.insert(0,"text")
     return found
+
+
+def indicates_ready_to_chat(text: str) -> bool:
+    """识别当前说话人明确宣布回到聊天的开头陈述。"""
+    return bool(_READY_TO_CHAT_RE.match(text.strip()))
 
 
 def classify_intent(text: str, media: list[str]) -> str:

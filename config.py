@@ -73,6 +73,12 @@ class PluginSettings(PluginConfigBase):
 
     __ui_label__: ClassVar[str] = "插件设置"
     __ui_order__: ClassVar[int] = 0
+
+    data_directory: str = Field(
+        default="", description="持久数据目录；留空使用宿主授予的标准目录。",
+        json_schema_extra=_ui("持久数据目录", "本机部署可指定 D 盘独立目录；更改路径前应停止插件并迁移原数据库。", 90,
+                             label_en="Persistent Data Directory", hint_en="Leave empty for the host-managed directory. Stop the plugin and migrate its database before changing this path."),
+    )
     __ui_i18n__: ClassVar[dict[str, dict[str, str]]] = {
         "en_US": {"title": "Plugin Settings", "description": "Basic switch, model and administrator settings."}
     }
@@ -160,24 +166,24 @@ class UserProfile(PluginConfigBase):
         default="friend",
         description="该私聊用户在麦麦关系中的权限角色。",
         json_schema_extra=_ui(
-            "关系角色", "最多只能有一个主人；朋友不会获得主人专属上下文和敏感能力。", 3,
+            "关系角色", "内部模式最多一个主人；外部关系模式忽略此项，权限以身份插件手动名单为准。", 3,
             label_en="Relationship Role", hint_en="At most one owner is allowed. Friends never receive owner-only context.",
             enum_labels={"owner": "主人（owner）", "friend": "朋友（friend）"},
         ),
     )
     daily_proactive_max: int = Field(
-        default=1, ge=0, le=20,
-        description="该用户每天最多实际收到的主动消息次数（硬上限，不是目标次数）。",
+        default=5, ge=0, le=20,
+        description="该用户每天实际收到的主动私聊次数上限。",
         json_schema_extra=_ui(
-            "用户每日主动上限", "每日最多主动发送 N 次（硬上限，非目标次数）。实际次数常少于该值：受免打扰、冷却、精力、候选评分和 Planner 自主决策约束。0 表示禁止主动消息；主人通常填 2，朋友通常填 1。", 4,
-            label_en="Per-user Daily Proactive Limit", hint_en="Hard cap of proactive messages per day (not a target). Actual count is often lower due to quiet hours, cooldown, energy, scoring and Planner decisions. Zero disables proactive messages.",
+            "用户每日主动上限", "默认每天最多 5 次。设为 0 即暂停主动私聊。按清醒时长错开发话机会，每段睡眠最多一次，个人免打扰优先。", 4,
+            label_en="Per-user Daily Proactive Limit", hint_en="Defaults to five chats per day. Zero pauses proactive chat. Openings are spread across awake hours, with at most one chat per sleep period. Personal quiet hours take precedence.",
         ),
     )
     initial_temperature: int = Field(
         default=30, ge=0, le=100,
         description="首次创建用户档案时使用的关系温度。",
         json_schema_extra=_ui(
-            "初始关系温度", "仅首次创建档案时使用。30 表示“认识”，不会自动进入恋爱语气。", 6,
+            "初始关系温度", "仅内部关系模式首建档案时使用，外部关系模式不使用此分值。", 6,
             label_en="Initial Relationship Temperature", hint_en="Used only when the profile is first created. Default 30 means acquaintance.",
         ),
     )
@@ -213,8 +219,8 @@ class UserProfile(PluginConfigBase):
         """把 v1.6 的 -1 角色默认值迁移为明确数字。"""
         if not isinstance(value,dict):return value
         data=dict(value)
-        try:configured=int(data.get("daily_proactive_max",1))
-        except (TypeError,ValueError):configured=1
+        try:configured=int(data.get("daily_proactive_max",5))
+        except (TypeError,ValueError):configured=5
         if configured<0:data["daily_proactive_max"]=2 if str(data.get("role") or "friend")=="owner" else 1
         return data
 
@@ -265,6 +271,9 @@ class UsersSettings(PluginConfigBase):
             label_en="Private User Profiles", hint_en="Life state is global while relationship, quota and quiet hours are per user.",
         ),
     )
+    def enabled_profile(self, user_id: str) -> UserProfile | None:
+        return next((profile for profile in self.profiles if profile.enabled and profile.user_id == user_id), None)
+
     @model_validator(mode="after")
     def only_one_owner(self) -> "UsersSettings":
         user_ids=[profile.user_id for profile in self.profiles if profile.user_id]
@@ -299,7 +308,7 @@ class SocialGroupProfile(PluginConfigBase):
     )
     relay_target_enabled: bool = Field(
         default=False, description="是否允许管理员向该群发起显式转述。",
-        json_schema_extra=_ui("允许作为转述目标", "启用后主人或管理员可用 /麦麦转述 群QQ号 内容触发该群 Planner。", 3,
+        json_schema_extra=_ui("允许作为转述目标", "启用后主人或管理员可用 /八千代转述 群QQ号 内容触发该群 Planner。", 3,
                               label_en="Allow Relay Target", hint_en="Allow owner/admin to trigger this group's Planner with the Chinese relay command."),
     )
     rest_gate_enabled: bool = Field(
@@ -354,12 +363,12 @@ class CreationSettings(PluginConfigBase):
     max_body_chars: int = Field(default=4000, ge=500, le=16000, description="作品正文最大字符数。",
         json_schema_extra=_ui("作品正文上限", "用于限制模型成本和 SQLite 文本体积。", 10,
                               label_en="Maximum Work Length", hint_en="Limits model cost and SQLite text size."))
-    external_reading_enabled: bool = Field(default=False, description="从可选插件 API 读取素材摘要。",
-        json_schema_extra=_ui("启用外部阅读联动", "默认关闭；只调用下方插件 API，不直接联网。", 11,
-                              label_en="Enable External Reading", hint_en="Calls an optional plugin API only and performs no direct networking."))
+    external_reading_enabled: bool = Field(default=False, description="读取外部插件素材或已缓存的公开新闻。",
+        json_schema_extra=_ui("启用外部阅读联动", "默认关闭；复用插件 API 或新闻缓存，不新增联网请求。", 11,
+                              label_en="Enable External Reading", hint_en="Reuses a plugin API or cached news without additional web requests."))
     external_reading_api_name: str = Field(default="", description="外部阅读插件公开 API 名称。",
-        json_schema_extra=_ui("外部阅读 API", "例如 other-plugin.list_reading_items；留空不会调用。", 12,
-                              label_en="External Reading API", hint_en="Public plugin API name; left empty to disable calls."))
+        json_schema_extra=_ui("外部阅读 API", "例如 other-plugin.list_reading_items；留空时使用已读的有来源公开新闻。", 12,
+                              label_en="External Reading API", hint_en="Public plugin API name; leave blank to use cached news with source links."))
     external_reading_max_items: int = Field(default=3, ge=1, le=20, description="每次最多读取素材数。",
         json_schema_extra=_ui("每次阅读素材上限", "忽略二进制，只处理标题和有限长度文字。", 13,
                               label_en="External Reading Item Limit", hint_en="Binary fields are ignored; only bounded text is processed."))
@@ -849,6 +858,22 @@ class ContextSettings(PluginConfigBase):
         default=True, description="向配置私聊注入生活与关系背景。",
         json_schema_extra=_ui("启用被动回复增强", "只处理配置的私聊用户，不影响群聊。", 0, label_en="Enable Passive Context", hint_en="Inject context only for configured private users."),
     )
+    relationship_enabled: bool = Field(
+        default=True,
+        description="维护并注入麦生活自己的关系温度与称呼边界。已有身份认知和印象卡片时关闭。",
+        json_schema_extra=_ui(
+            "麦生活关系系统", "关闭后保留生活背景与隐私档案，关系和称呼交给现有插件；不再结算关系温度或据此评分。", 1,
+            label_en="MaiLife Relationships", hint_en="Disable when existing identity and impression plugins manage relationships. Life context and privacy profiles remain enabled.",
+        ),
+    )
+    relationship_provider: Literal["internal", "existing_identity"] = Field(
+        default="internal", description="关系来源；existing_identity 统一读取身份认知与印象卡片，内部温度停止结算。",
+        json_schema_extra=_ui("关系数据来源", "外部模式的主人权限来自身份手动名单，好感来自印象卡片原始分值。", 1),
+    )
+    outreach_feedback_enabled: bool = Field(
+        default=False, description="外部关系模式下，统计已送达主动消息的有效观察日并向好感系统提交回应情况。",
+        json_schema_extra=_ui("主动互动回应度", "等待48小时；已知忙碌、免打扰和睡眠排除，按用户每天最多一项观察。", 2),
+    )
     continuity_enabled: bool = Field(
         default=True, description="维护轻量未完话题元数据。",
         json_schema_extra=_ui("启用连续话题", "异步整理意图与未完话题，不复制完整聊天记忆。", 1, label_en="Enable Conversation Continuity", hint_en="Maintain lightweight unfinished-topic metadata asynchronously."),
@@ -933,6 +958,12 @@ class ModelRoutingSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "模型与成本编排"
     __ui_order__: ClassVar[int] = 13
 
+    model_override: str = Field(
+        default="", description="插件后台调用使用的已配置模型 ID；留空继承各任务的模型池。",
+        json_schema_extra=_ui("后台模型覆盖", "仅影响麦生活自己的日程、场景和生活记录生成；不改变主程序聊天模型。", 90,
+                             label_en="Background Model Override", hint_en="An existing configured model ID for MaiLife background generation only. Chat Planner/Replyer routing stays unchanged."),
+    )
+
     fast_task: str = Field(default="utils", description="快速整理任务名。", json_schema_extra=_ui("快速任务", "默认 utils，用于连续话题等轻量任务。", 0, label_en="Fast Task", hint_en="MaiBot task name for lightweight analysis."))
     reasoning_task: str = Field(default="planner", description="推理任务名。", json_schema_extra=_ui("推理任务", "默认 planner，用于搜索规划、自我关联等复杂判断（日程与场景已改走快速任务）。", 1, label_en="Reasoning Task", hint_en="MaiBot task name for reasoning."))
     creative_task: str = Field(default="replyer", description="创作任务名。", json_schema_extra=_ui("创作任务", "默认 replyer，用于梦境和叙事文本。", 2, label_en="Creative Task", hint_en="MaiBot task name for narrative generation."))
@@ -988,6 +1019,14 @@ class ScheduleSettings(PluginConfigBase):
             label_en="Schedule Generation Hour", hint_en="Hour from 0 to 23. Missing schedules are still generated immediately.",
         ),
     )
+    semantic_dedup_enabled: bool = Field(
+        default=False, description="由现有 decision 任务审核日程、场景及主动消息的语义重复，过于相近时重新生成。",
+        json_schema_extra=_ui("Decision 语义去重", "按近期实际内容判断，不按关键词禁用FUSHI或音乐；审核失败不会放行未经确认的主动消息。", 1),
+    )
+    semantic_history_days: int = Field(
+        default=3, ge=1, le=14, description="Decision 语义审核回看的自然日数。",
+        json_schema_extra=_ui("语义去重回看天数", "日程与场景参考这些天的安排，主动消息参考这段时间实际发送的内容。", 2),
+    )
     detail_lead_minutes: int = Field(
         default=60, ge=10, le=240,
         description="提前多少分钟细化即将开始的生活场景。",
@@ -1021,14 +1060,31 @@ class ScheduleSettings(PluginConfigBase):
         ),
     )
 
+    anitabi_locations: bool = Field(
+        default=False,
+        description="生成日程时查询独立的 AniTabi 动画巡礼插件，为现实外出活动提供取景点资料。",
+        json_schema_extra=_ui(
+            "使用 AniTabi 巡礼点", "使用下面指定的作品地标作为日程素材。", 5,
+            label_en="Use AniTabi Landmarks", hint_en="Use landmarks from the work specified below in daily schedules.",
+        ),
+    )
+    anitabi_subject_id: int = Field(
+        default=0, ge=0, le=999999999,
+        description="麦生活日程使用的 Bangumi 作品 ID。",
+        json_schema_extra=_ui(
+            "日程巡礼作品 ID", "在 Bangumi 条目地址中找到数字 ID。", 6,
+            label_en="Schedule Pilgrimage Work ID", hint_en="Use the numeric ID from the Bangumi subject URL.",
+        ),
+    )
+
 
 class ProactiveSettings(PluginConfigBase):
-    """主动私聊的公共冷却和评分阈值；每日额度只在用户档案中配置。"""
+    """主动私聊的巡检与评分设置，发话节奏按用户额度和清醒时长分配。"""
 
     __ui_label__: ClassVar[str] = "主动私聊"
     __ui_order__: ClassVar[int] = 9
     __ui_i18n__: ClassVar[dict[str, dict[str, str]]] = {
-        "en_US": {"title": "Proactive Private Chat", "description": "Shared cooldown and candidate scoring settings."}
+        "en_US": {"title": "Proactive Private Chat", "description": "Patrol and scoring settings for pacing based on each user's daily quota."}
     }
 
     enabled: bool = Field(
@@ -1053,21 +1109,6 @@ class ProactiveSettings(PluginConfigBase):
         json_schema_extra=_ui(
             "契机去重窗口（小时）", "同一用户相同 topic 的机会在该窗口内只投递一次；0=关闭去重。默认 6 小时。", 1,
             label_en="Topic Dedup Window (h)", hint_en="Same-topic opportunities are delivered once within this window. 0 disables."),
-    )
-    daily_eval_max: int = Field(
-        default=8, ge=0, le=100,
-        description="每日契机评估预算：投递给 Planner 评估的次数上限（与发送额度分离）；0=不限制。",
-        json_schema_extra=_ui(
-            "每日评估预算", "投递给 Planner 评估的每日次数上限，与每日主动发送额度分离——评估被否决也计数。0=不限制。默认 8。", 1,
-            label_en="Daily Evaluation Budget", hint_en="Daily cap on Planner evaluations (separate from send quota). 0 = unlimited."),
-    )
-    min_interval_minutes: int = Field(
-        default=180, ge=1, le=1440,
-        description="同一用户两次主动消息之间的最小间隔。",
-        json_schema_extra=_ui(
-            "主动消息最小间隔（分钟）", "默认 180 分钟，防止短时间连续打扰同一用户。", 2,
-            label_en="Minimum Proactive Interval (min)", hint_en="Minimum time between proactive messages to the same user.",
-        ),
     )
     recent_user_silence_minutes: int = Field(
         default=30, ge=0, le=240,
@@ -1117,14 +1158,23 @@ class LinkageSettings(PluginConfigBase):
     __ui_label__: ClassVar[str] = "插件联动"
     __ui_order__: ClassVar[int] = 15
 
+    provider: Literal["drawpic", "oaimage"] = Field(
+        default="drawpic", description="生活画面分享使用的绘图插件。",
+        json_schema_extra=_ui(
+            "绘图插件", "OAImage 复用 generate_image 工具及已配置的麦麦外貌和参考图。", 0,
+            label_en="Drawing Plugin", hint_en="OAImage reuses generate_image and the existing bot appearance/reference image configuration.",
+            enum_labels={"drawpic":"麦麦绘图", "oaimage":"OAImage"},
+        ),
+    )
+
     drawpic_enabled: bool = Field(
         default=False,
-        description="启用麦麦绘图联动：聊天中麦麦想分享日常生活画面时，可调用麦麦绘图插件（maimai-drawpic-plugin）的工具生成并发送。",
+        description="启用生活绘图联动：聊天中自然分享日常画面时，引导调用所选绘图插件。",
         json_schema_extra=_ui(
-            "启用麦麦绘图联动",
-            "默认关闭；需已安装麦麦绘图插件。检测仅确认插件已加载（不校验其版本与绘图平台 Key），注入时另需 draw 工具对当前对话可见，否则不生效。",
+            "启用生活绘图联动",
+            "默认关闭；需所选绘图插件已加载，且本轮可用 draw 或 generate_image 工具。检测不验证上游凭据。",
             0, label_en="Drawpic Linkage",
-            hint_en="Off by default; requires the maimai-drawpic-plugin installed. Detection confirms the plugin is loaded only (no version or platform-key check); injection also requires the draw tool to be visible in the current chat.",
+            hint_en="Off by default; requires the selected plugin to be loaded and its drawing tool to be visible. Provider credentials are not verified by detection.",
         ),
     )
     persona_ref_draw: bool = Field(
@@ -1180,7 +1230,7 @@ class MaiLifeSettings(PluginConfigBase):
     )
     proactive: ProactiveSettings = Field(
         default_factory=ProactiveSettings,
-        json_schema_extra=_ui("主动私聊", "公共冷却和评分；每日额度在每个私聊用户中设置。", 9, label_en="Proactive Private Chat", hint_en="Shared cooldown and scoring; daily limits are configured per user."),
+        json_schema_extra=_ui("主动私聊", "巡检和候选评分；按每个私聊用户的实际发送额度安排节奏。", 9, label_en="Proactive Private Chat", hint_en="Patrol and scoring; pacing follows each user's daily send quota."),
     )
     network: NetworkSettings = Field(
         default_factory=NetworkSettings,
@@ -1209,6 +1259,14 @@ class MaiLifeSettings(PluginConfigBase):
         default_factory=LinkageSettings,
         json_schema_extra=_ui("插件联动", "与其它插件的协作开关；目标插件未安装时不生效。", 15, label_en="Plugin Linkage", hint_en="Collaboration switches; ineffective when the target plugin is absent."),
     )
+
+    def allows_group_share(self, profile: UserProfile | None, role: str | None=None) -> bool:
+        """群聊摘要须满足个人订阅和适用的全局群转私开关。"""
+        if not (self.group.relay_enabled and profile and profile.enabled and profile.group_to_private_enabled):
+            return False
+        if self.context.relationship_provider=="existing_identity" and role not in {"owner","friend"}:
+            return False
+        return (role or profile.role) != "owner" or self.group.owner_group_to_private_enabled
 
     @model_validator(mode="before")
     @classmethod

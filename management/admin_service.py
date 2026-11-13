@@ -6,6 +6,7 @@ from typing import Any
 from datetime import datetime
 
 from ..config import PLUGIN_VERSION
+from ..core.relationship_bridge import relationship_fields
 
 
 _SCOPES={"overview","users","groups","dates","bookshelf","tokens","proactive","search"}
@@ -42,7 +43,8 @@ class AdminService:
     async def _users(self,limit:int)->list[dict[str,Any]]:
         users=await self.store.list_users()
         return [{"user_id":item["user_id"],"display_name":item.get("display_name") or "",
-                 "role":item.get("role") or "friend","temperature":round(float(item.get("temperature") or 0),1),
+                 "role":item.get("role") or "friend",
+                 **relationship_fields(item,self.config.context.relationship_enabled),
                  "proactive_enabled":bool(item.get("proactive_enabled")),
                  "daily_proactive_max":int(item.get("daily_proactive_max") or 0),
                  "proactive_count":int(item.get("proactive_count") or 0),
@@ -90,7 +92,9 @@ class AdminService:
                     f"联网 {'开' if data['network_enabled'] else '关'}｜社交 {'开' if data['social_enabled'] else '关'}｜创作 {'开' if data['creation_enabled'] else '关'}")
         if scope=="users":
             lines=["用户角色与主动额度"]
-            lines.extend(f"{item['user_id']} {item['display_name'] or '未读取昵称'}｜{item['role']}｜温度 {item['temperature']}｜主动 {item['proactive_count']}/{item['daily_proactive_max']}"
+            lines.extend(f"{item['user_id']} {item['display_name'] or '未读取昵称'}｜{item['role']}｜"
+                         f"{'好感 '+str(item['affinity']) if item.get('relationship_source')=='impression_card+identity' else '温度 '+str(item['temperature'])}｜"
+                         f"主动 {item['proactive_count']}/{item['daily_proactive_max']}"
                          for item in data["items"])
         elif scope=="groups":
             lines=["QQ群配置"]

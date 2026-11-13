@@ -9,8 +9,10 @@ import shutil
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Awaitable, Callable, Iterable, Iterator, Optional
+from zoneinfo import ZoneInfo
 
 SCHEMA_VERSION = 14
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
@@ -36,6 +38,9 @@ class LifeStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()
         self._logger = logger
+        self.relationship_resolver: Optional[Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = None
+        self.outreach_tracking = False
+        self.outreach_timezone = "Asia/Shanghai"
         # 测试用临时库默认 memory（回滚日志放内存，不落盘，避免 -journal 文件残留）；
         # 生产 data 库由 plugin.py 显式传入 delete，保留崩溃回滚保护。
         self._journal_mode = str(journal_mode or "memory").strip().casefold() or "memory"
@@ -207,12 +212,19 @@ class LifeStore:
             CREATE TABLE IF NOT EXISTS users(
               user_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL, proactive_enabled INTEGER NOT NULL,
               display_name TEXT NOT NULL, temperature REAL NOT NULL,
-              role TEXT NOT NULL DEFAULT 'friend', daily_proactive_max INTEGER NOT NULL DEFAULT 1,
+              role TEXT NOT NULL DEFAULT 'friend', daily_proactive_max INTEGER NOT NULL DEFAULT 5,
               quiet_start TEXT NOT NULL, quiet_end TEXT NOT NULL,
               stream_id TEXT NOT NULL DEFAULT '', last_user_message_at REAL NOT NULL DEFAULT 0,
               last_proactive_at REAL NOT NULL DEFAULT 0,
+              proactive_paused_at REAL NOT NULL DEFAULT 0,
               proactive_day TEXT NOT NULL DEFAULT '', proactive_count INTEGER NOT NULL DEFAULT 0,
               last_relation_day TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS outreach_observations(
+              user_id TEXT NOT NULL, day TEXT NOT NULL,
+              first_sent_at REAL NOT NULL DEFAULT 0, responded_at REAL NOT NULL DEFAULT 0,
+              excluded INTEGER NOT NULL DEFAULT 0, closed_at REAL NOT NULL,
+              synced INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,day)
             );
             CREATE TABLE IF NOT EXISTS interaction_events(
               id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
@@ -227,6 +239,11 @@ class LifeStore:
               host_task_id TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_proactive_pending ON proactive_events(stream_id,status,expires_at);
+            CREATE TABLE IF NOT EXISTS proactive_sent_text(
+              event_id TEXT NOT NULL, content_hash TEXT NOT NULL, user_id TEXT NOT NULL,
+              sent_at REAL NOT NULL, text TEXT NOT NULL, PRIMARY KEY(event_id,content_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_proactive_sent_text_user ON proactive_sent_text(user_id,sent_at);
             -- 主动候选跳过原因统计：按用户、原因、自然日聚合，供 /麦麦管理 主动 诊断。
             CREATE TABLE IF NOT EXISTS proactive_skip_stats(
               user_id TEXT NOT NULL, reason TEXT NOT NULL, day TEXT NOT NULL,
@@ -465,7 +482,9 @@ class LifeStore:
         )
         # v1 数据库可能已经存在 users 表；只补列，不重建用户数据。
         self._ensure_column("users", "role", "TEXT NOT NULL DEFAULT 'friend'")
-        self._ensure_column("users", "daily_proactive_max", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("users", "daily_proactive_max", "INTEGER NOT NULL DEFAULT 5")
+        # 加列可由旧 Runner 安全忽略，保留原版本库的回滚能力。
+        self._ensure_column("users", "proactive_paused_at", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("proactive_opportunities", "target_user_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("relay_candidates", "opportunity_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("proactive_events", "host_task_id", "TEXT NOT NULL DEFAULT ''")
@@ -871,7 +890,7 @@ class LifeStore:
             self.conn.commit()
 
     async def sync_users(self, profiles: Iterable[Any]) -> None:
-        """将 WebUI 用户列表同步到运行库；QQ 号与角色配置是身份判断的唯一来源。"""
+        """同步私聊接收名单和偏好；外部模式的角色在读取时由身份接口解析。"""
         async with self._lock:
             with self._tx() as conn:
                 seen=[]
@@ -879,8 +898,9 @@ class LifeStore:
                     uid=str(p.user_id).strip()
                     if not uid: continue
                     seen.append(uid)
+                    previous=conn.execute("SELECT quiet_start,quiet_end FROM users WHERE user_id=?",(uid,)).fetchone()
                     role=str(getattr(p,"role","friend") or "friend")
-                    daily_limit=max(0,min(20,int(getattr(p,"daily_proactive_max",1))))
+                    daily_limit=max(0,min(20,int(getattr(p,"daily_proactive_max",5))))
                     conn.execute(
                         """INSERT INTO users(user_id,enabled,proactive_enabled,display_name,temperature,role,daily_proactive_max,quiet_start,quiet_end)
                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
@@ -889,22 +909,97 @@ class LifeStore:
                         quiet_start=excluded.quiet_start,quiet_end=excluded.quiet_end""",
                         (uid,int(p.enabled),int(p.proactive_enabled),"",float(p.initial_temperature),role,daily_limit,p.quiet_start,p.quiet_end),
                     )
+                    if self.outreach_tracking and previous and tuple(previous)!=(p.quiet_start,p.quiet_end):
+                        self._excuse_outreach_locked(conn,uid,time.time())
                 if seen:
                     marks=",".join("?" for _ in seen)
                     conn.execute(f"UPDATE users SET enabled=0,proactive_enabled=0 WHERE user_id NOT IN ({marks})", seen)
                 else:
                     conn.execute("UPDATE users SET enabled=0,proactive_enabled=0")
+                if self.outreach_tracking:
+                    conn.execute(
+                        """UPDATE outreach_observations SET excluded=1 WHERE synced=0 AND closed_at>?
+                        AND user_id IN (SELECT user_id FROM users WHERE enabled=0 OR proactive_enabled=0 OR daily_proactive_max=0)""",
+                        (time.time(),),
+                    )
 
     async def get_user(self, user_id: str) -> dict[str, Any]:
         async with self._lock:
             row=self.conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
-            return dict(row) if row else {}
+            user=dict(row) if row else {}
+        return await self.relationship_resolver(user) if user and self.relationship_resolver else user
+
+    async def set_user_proactive_preferences(
+        self, user_id: str, *,
+        proactive_enabled: bool | None = None,
+        daily_proactive_max: int | None = None,
+        quiet_start: str | None = None,
+        quiet_end: str | None = None,
+    ) -> bool:
+        async with self._lock:
+            with self._tx() as conn:
+                updated = conn.execute(
+                    """UPDATE users SET proactive_enabled=COALESCE(?,proactive_enabled),
+                    daily_proactive_max=COALESCE(?,daily_proactive_max),
+                    quiet_start=COALESCE(?,quiet_start),quiet_end=COALESCE(?,quiet_end)
+                    WHERE user_id=? AND enabled=1""",
+                    (proactive_enabled, daily_proactive_max, quiet_start, quiet_end, user_id),
+                )
+                if updated.rowcount and self.outreach_tracking and (
+                    proactive_enabled is False or daily_proactive_max == 0 or quiet_start is not None
+                ):
+                    self._excuse_outreach_locked(conn, user_id, time.time())
+                return updated.rowcount == 1
+
+    async def pause_proactive_for_message(self, user_id: str, stream_id: str, message_at: float) -> bool:
+        """只对仍是该用户最新来信的私聊轮次提交一次暂停。"""
+        async with self._lock:
+            with self._tx() as conn:
+                updated = conn.execute(
+                    """UPDATE users SET proactive_paused_at=? WHERE user_id=? AND stream_id=?
+                    AND enabled=1 AND last_user_message_at=? AND proactive_paused_at=0""",
+                    (message_at, user_id, stream_id, message_at),
+                )
+                if updated.rowcount and self.outreach_tracking:
+                    self._excuse_outreach_locked(conn, user_id, message_at)
+                return updated.rowcount == 1
 
     async def list_users(self, proactive_only: bool=False, *, include_disabled:bool=False) -> list[dict[str, Any]]:
         async with self._lock:
             sql="SELECT * FROM users" if include_disabled else "SELECT * FROM users WHERE enabled=1"
             if proactive_only:sql += " WHERE enabled=1 AND proactive_enabled=1" if include_disabled else " AND proactive_enabled=1"
-            return [dict(r) for r in self.conn.execute(sql).fetchall()]
+            users=[dict(r) for r in self.conn.execute(sql).fetchall()]
+        if self.relationship_resolver:
+            return [await self.relationship_resolver(user) for user in users]
+        return users
+
+    def _excuse_outreach_locked(self, conn: sqlite3.Connection, user_id: str, now: float) -> None:
+        """Known unavailability removes still-open observations, never changes old scores."""
+        conn.execute(
+            "UPDATE outreach_observations SET excluded=1 WHERE user_id=? AND synced=0 AND closed_at>?",
+            (user_id, now),
+        )
+
+    async def outreach_feedback_due(self, now: float) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows=self.conn.execute(
+                """SELECT user_id,day,first_sent_at,responded_at,excluded FROM outreach_observations
+                WHERE synced=0 AND closed_at<=? ORDER BY user_id,day LIMIT 200""", (now,),
+            ).fetchall()
+        return [
+            {"user_id":row[0],"day":row[1],"outcome":
+             "excused" if row[4] else "answered" if row[2] and row[3] else "returned" if row[3] else "unanswered"}
+            for row in rows
+        ]
+
+    async def confirm_outreach_feedback(self, user_id: str, day: str) -> None:
+        async with self._lock:
+            with self._tx() as conn:
+                conn.execute("UPDATE outreach_observations SET synced=1 WHERE user_id=? AND day=?", (user_id,day))
+                conn.execute(
+                    "DELETE FROM outreach_observations WHERE user_id=? AND synced=1 AND day<date(?,'-90 days')",
+                    (user_id,day),
+                )
 
     async def set_user_stream(self, user_id: str, stream_id: str) -> None:
         async with self._lock:
@@ -919,16 +1014,36 @@ class LifeStore:
 
     # 同时记录活跃时段，并识别用户是否回应了近期主动消息。
     async def record_interaction(self, user_id: str, text: str, now: float, hour: int,
-                                 source_message_id: str="") -> None:
+                                 source_message_id: str="", *, resume_proactive: bool=False) -> None:
         """记录截断后的互动摘要，并原子更新用户活跃时间和主动回复标记。"""
         async with self._lock:
             with self._tx() as conn:
-                conn.execute("UPDATE users SET last_user_message_at=? WHERE user_id=?",(now,user_id))
+                conn.execute(
+                    """UPDATE users SET last_user_message_at=?,
+                    proactive_paused_at=CASE WHEN ? AND proactive_paused_at<? THEN 0 ELSE proactive_paused_at END
+                    WHERE user_id=?""",
+                    (now, resume_proactive, now, user_id),
+                )
                 conn.execute(
                     """INSERT INTO interaction_events
                     (user_id,created_at,kind,hour,content_summary,source_message_id) VALUES(?,?,?,?,?,?)""",
                     (user_id,now,"message",hour,text[:240],source_message_id[:240]),
                 )
+                if self.outreach_tracking:
+                    conn.execute(
+                        """UPDATE outreach_observations SET responded_at=?
+                        WHERE user_id=? AND synced=0 AND excluded=0 AND first_sent_at>0
+                        AND first_sent_at<=? AND closed_at>?""", (now,user_id,now,now),
+                    )
+                    # A later self-initiated conversation also lets a previously distant relationship recover.
+                    day=datetime.fromtimestamp(now,ZoneInfo(self.outreach_timezone)).date().isoformat()
+                    conn.execute(
+                        """INSERT OR IGNORE INTO outreach_observations(user_id,day,responded_at,closed_at)
+                        SELECT ?,?,?,? WHERE EXISTS
+                        (SELECT 1 FROM outreach_observations WHERE user_id=? AND first_sent_at>0)
+                        AND EXISTS(SELECT 1 FROM users WHERE user_id=? AND enabled=1 AND proactive_paused_at=0)""",
+                        (user_id,day,now,now+48*3600,user_id,user_id),
+                    )
                 pending=conn.execute(
                     "SELECT id,sent_at FROM proactive_events WHERE user_id=? AND status='sent' AND sent_at>? ORDER BY sent_at DESC LIMIT 1",
                     (user_id,now-7200),
@@ -1022,7 +1137,7 @@ class LifeStore:
         marks=",".join("?" for _ in ids)
         async with self._lock:
             with self._tx() as conn:
-                cursor=conn.execute(f"UPDATE rest_backlogs SET consumed=1 WHERE id IN ({marks})",ids)
+                cursor=conn.execute(f"UPDATE rest_backlogs SET consumed=1 WHERE id IN ({marks}) AND consumed=0",ids)
                 return cursor.rowcount
 
     async def peek_rest_backlogs(self, user_id: str) -> list[str]:
@@ -1090,8 +1205,9 @@ class LifeStore:
         if not stream_id or not host_task_id:return {}
         async with self._lock:
             row=self.conn.execute(
-                """SELECT id,user_id,opportunity_id,stream_id,status,created_at,expires_at,sent_at,host_task_id
-                FROM proactive_events WHERE stream_id=? AND host_task_id=?""",
+                """SELECT e.*,o.privacy AS opportunity_privacy,o.topic AS opportunity_topic FROM proactive_events e
+                LEFT JOIN proactive_opportunities o ON o.id=e.opportunity_id
+                WHERE e.stream_id=? AND e.host_task_id=?""",
                 (stream_id,host_task_id),
             ).fetchone()
             return dict(row) if row else {}
@@ -1109,7 +1225,7 @@ class LifeStore:
 
     # 只有 send_service.after_send 确认平台发送成功后，才增加实际主动额度。
     async def mark_pending_sent(self, stream_id: str, now: float, day: str = "", *,
-                                event_id: str = "", host_task_id: str = "") -> bool:
+                                event_id: str = "", host_task_id: str = "", response_eligible: bool = False) -> bool:
         """提交已成功发送的主动候选；event_id 优先，其次 host_task_id，最后会话兜底。
 
         不要求 status='pending'：发送确认可能跨越 120 秒过期边界，只要事件尚未结算
@@ -1142,6 +1258,18 @@ class LifeStore:
             with self._tx() as conn:
                 conn.execute("UPDATE proactive_events SET status='sent',sent_at=? WHERE id=?",(now,row[0]))
                 day=day or time.strftime("%Y-%m-%d",time.localtime(now))
+                if self.outreach_tracking and response_eligible:
+                    eligible=conn.execute(
+                        "SELECT 1 FROM users WHERE user_id=? AND enabled=1 AND proactive_enabled=1 AND proactive_paused_at=0",
+                        (row[1],),
+                    ).fetchone()
+                    if eligible:
+                        conn.execute(
+                            """INSERT INTO outreach_observations(user_id,day,first_sent_at,closed_at) VALUES(?,?,?,?)
+                            ON CONFLICT(user_id,day) DO UPDATE SET
+                            first_sent_at=CASE WHEN first_sent_at=0 THEN excluded.first_sent_at ELSE first_sent_at END,
+                            closed_at=MAX(closed_at,excluded.closed_at)""", (row[1],day,now,now+48*3600),
+                        )
                 user=conn.execute("SELECT proactive_day FROM users WHERE user_id=?",(row[1],)).fetchone()
                 if user and user[0]==day:
                     conn.execute("UPDATE users SET proactive_count=proactive_count+1,last_proactive_at=? WHERE user_id=?",(now,row[1]))
@@ -1222,6 +1350,72 @@ class LifeStore:
                 (user_id,topic,float(since)),
             ).fetchone()
             return row is not None
+
+    async def record_proactive_text(self, event_id: str, text: str, sent_at: float) -> bool:
+        """Only actual successful sends attributed to a confirmed event enter the semantic history."""
+        text=" ".join(str(text).split())[:1200]
+        if not text:return False
+        digest=hashlib.sha256(text.encode("utf-8")).hexdigest()
+        async with self._lock:
+            with self._tx() as conn:
+                cursor=conn.execute(
+                    """INSERT OR IGNORE INTO proactive_sent_text(event_id,content_hash,user_id,sent_at,text)
+                    SELECT id,?,user_id,?,? FROM proactive_events WHERE id=? AND sent_at>0""",
+                    (digest,sent_at,text,event_id),
+                )
+                return cursor.rowcount==1
+
+    async def recent_proactive_text(self, user_id: str, since: float, limit: int=100) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows=self.conn.execute(
+                """SELECT event_id,MAX(sent_at) AS at,GROUP_CONCAT(text,' ') AS content FROM
+                (SELECT * FROM proactive_sent_text WHERE user_id=? AND sent_at>=? ORDER BY sent_at,rowid)
+                GROUP BY event_id ORDER BY at DESC LIMIT ?""",
+                (user_id,since,max(1,min(100,int(limit)))),
+            ).fetchall()
+        return [{"event_id":row[0],"sent_at":row[1],"text":row[2][:1600]} for row in reversed(rows)]
+
+    async def latest_user_message_id(self, user_id: str) -> str:
+        """恢复该用户最后一次真实私聊记录的原始编号，供主动轮定位；不创建来信或授权。"""
+        async with self._lock:
+            row=self.conn.execute(
+                """SELECT source_message_id FROM interaction_events
+                WHERE user_id=? AND kind='message' AND source_message_id<>''
+                ORDER BY created_at DESC,id DESC LIMIT 1""",(user_id,),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    async def semantic_user_context(self, user_id: str, since: float) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows=self.conn.execute(
+                """SELECT created_at,content_summary FROM interaction_events
+                WHERE user_id=? AND kind='message' AND created_at>=? ORDER BY created_at DESC LIMIT 4""",
+                (user_id,since),
+            ).fetchall()
+        return [{"at":row[0],"text":row[1]} for row in reversed(rows)]
+
+    async def semantic_schedule_history(self, day: str, days: int, *, until_minute: int | None=None) -> list[dict[str, Any]]:
+        start=(datetime.fromisoformat(day).date()-timedelta(days=days)).isoformat()
+        async with self._lock:
+            rows=self.conn.execute(
+                """SELECT f.day,f.kind,f.summary,s.scene FROM daily_framework f
+                LEFT JOIN detailed_scenes s ON s.framework_id=f.id
+                WHERE f.day>=? AND (f.day<? OR (f.day=? AND f.end_minute<=?))
+                AND f.kind NOT IN ('sleep','meal','nap')
+                ORDER BY f.day DESC,f.start_minute DESC LIMIT 200""",
+                (start,day,day,-1 if until_minute is None else until_minute),
+            ).fetchall()
+        return [{"day":row[0],"kind":row[1],"summary":row[2],"scene":row[3] or ""} for row in reversed(rows)]
+
+    async def bookshelf_type_hints(self, titles: Iterable[str]) -> list[dict[str,str]]:
+        titles=list(dict.fromkeys(str(title) for title in titles))[:50]
+        if not titles:return []
+        marks=",".join("?" for _ in titles)
+        async with self._lock:
+            rows=self.conn.execute(
+                f"SELECT title,doc_type,work_type FROM bookshelf_documents WHERE title IN ({marks})",titles,
+            ).fetchall()
+        return [{"title":row[0],"doc_type":row[1],"work_type":row[2]} for row in rows]
 
     async def last_proactive_attempt(self) -> dict[str, Any]:
         """最近一次主动投递事件（任意状态）；无则空字典。供沉默退避计算。"""
@@ -1342,18 +1536,13 @@ class LifeStore:
                     (group_id,group_id,self.GROUP_CATCHUP_RING),
                 )
 
-    async def list_group_catchup(self, group_id: str, limit: int=80) -> list[dict[str, Any]]:
+    async def list_group_catchup(self, group_id: str, start: float, end: float) -> list[dict[str, Any]]:
         async with self._lock:
             rows=self.conn.execute(
-                """SELECT * FROM group_catchup_messages WHERE group_id=?
-                ORDER BY created_at ASC LIMIT ?""",(group_id,int(limit)),
+                """SELECT * FROM group_catchup_messages WHERE group_id=? AND created_at>=? AND created_at<?
+                ORDER BY created_at DESC, id DESC LIMIT ?""",(group_id,start,end,self.GROUP_CATCHUP_RING),
             ).fetchall()
-            return [dict(row) for row in rows]
-
-    async def cleanup_group_catchup(self, before: float) -> None:
-        async with self._lock:
-            with self._tx() as conn:
-                conn.execute("DELETE FROM group_catchup_messages WHERE created_at<?",(before,))
+            return [dict(row) for row in reversed(rows)]
 
     async def get_continuity(self, user_id: str) -> dict[str, Any]:
         async with self._lock:
@@ -1524,7 +1713,8 @@ class LifeStore:
         if not stream_id or not host_task_id:return {}
         async with self._lock:
             row=self.conn.execute(
-                "SELECT * FROM relay_candidates WHERE target_stream_id=? AND host_task_id=? AND kind='explicit'",
+                """SELECT * FROM relay_candidates WHERE target_stream_id=? AND host_task_id=?
+                AND kind IN ('explicit','morning_catchup')""",
                 (stream_id,host_task_id),
             ).fetchone()
             return dict(row) if row else {}
@@ -1534,7 +1724,7 @@ class LifeStore:
         if not relay_id:return {}
         async with self._lock:
             row=self.conn.execute(
-                "SELECT * FROM relay_candidates WHERE id=? AND kind='explicit'",
+                "SELECT * FROM relay_candidates WHERE id=? AND kind IN ('explicit','morning_catchup')",
                 (relay_id,),
             ).fetchone()
             return dict(row) if row else {}
@@ -1551,7 +1741,7 @@ class LifeStore:
                 if host_task_id:
                     row=conn.execute(
                         """SELECT * FROM relay_candidates WHERE target_stream_id=? AND host_task_id=?
-                        AND kind='explicit' AND status='pending' AND (? OR expires_at>?)""",
+                        AND kind IN ('explicit','morning_catchup') AND status='pending' AND (? OR expires_at>?)""",
                         (stream_id,host_task_id,1 if allow_expired else 0,now),
                     ).fetchone()
                 else:
@@ -1803,6 +1993,10 @@ class LifeStore:
             data["content"]=str(current.get("content") or "")
             return data
 
+    async def has_reading_note(self, note_id: str) -> bool:
+        async with self._lock:
+            return self.conn.execute("SELECT 1 FROM reading_notes WHERE id=?", (note_id,)).fetchone() is not None
+
     async def save_reading_note(self, item: dict[str, Any]) -> bool:
         """外部阅读联动只接收有限文字摘要和生成批注，不接受二进制字段。"""
         async with self._lock:
@@ -1892,7 +2086,10 @@ class LifeStore:
                 (SELECT COUNT(*) FROM bookshelf_documents WHERE privacy='private') AS private_documents,
                 (SELECT COUNT(*) FROM proactive_events WHERE status='pending') AS pending_proactive"""
             ).fetchone()
-            return {key:int(row[key] or 0) for key in row.keys()} if row else {}
+            counts={key:int(row[key] or 0) for key in row.keys()} if row else {}
+        if self.relationship_resolver:
+            counts["owners"]=sum(user.get("role")=="owner" for user in await self.list_users())
+        return counts
 
     async def cleanup_runtime_records(self, now: float, usage_before: float, *,
                                       records_before: float = 0) -> None:
@@ -1902,6 +2099,7 @@ class LifeStore:
                 conn.execute("DELETE FROM wake_candidates WHERE expires_at<=?",(now,))
                 # 休息积压按 7 天保留期清理，避免关闭增强或长期静默后无界堆积。
                 conn.execute("DELETE FROM rest_backlogs WHERE created_at<=?",(now-7*86400,))
+                conn.execute("DELETE FROM proactive_sent_text WHERE sent_at<?",(now-30*86400,))
                 conn.execute("DELETE FROM reply_turns WHERE expires_at<=?",(now,))
                 conn.execute("DELETE FROM message_turn_sources WHERE expires_at<=?",(now,))
                 conn.execute(
@@ -1914,6 +2112,8 @@ class LifeStore:
                 self._expire_pending_locked(conn, now, max(0, 2), "")
                 conn.execute("DELETE FROM llm_usage_events WHERE created_at<?",(usage_before,))
                 conn.execute("DELETE FROM group_observations WHERE expires_at<=?",(now,))
+                conn.execute("DELETE FROM group_catchup_messages WHERE created_at<=?",(now-86400,))
+                conn.execute("DELETE FROM relay_candidates WHERE kind='morning_catchup' AND created_at<=?",(now-86400,))
                 conn.execute("UPDATE relay_candidates SET status='expired' WHERE expires_at<=? AND status IN ('pending','sending','queued')",(now,))
                 conn.execute("UPDATE creation_inspirations SET status='expired' WHERE status IN ('pending','creating') AND expires_at<=?",(now,))
                 if records_before>0:

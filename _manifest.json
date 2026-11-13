@@ -17,7 +17,13 @@
     "min_version": "2.7.0",
     "max_version": "2.91.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "plugin",
+      "id": "Alcpare.identity",
+      "version_spec": ">=1.2.0"
+    }
+  ],
   "plugin_type": "extension",
   "capabilities": [
     "send.text",
@@ -33,6 +39,7 @@
     "message.get_by_id",
     "api.call",
     "webui.claim_upload",
+    "maisaka.context.append",
     "maisaka.proactive.trigger",
     "config.get",
     "component.list_loaded_plugins",
@@ -46,7 +53,7 @@
     ]
   },
   "urls": {
-    "repository": "https://github.com/octmicy/Mai_life",
+    "repository": "https://github.com/krkr521/Mai_life",
     "homepage": "https://github.com/octmicy/Mai_life",
     "documentation": "https://docs.mai-mai.org"
   },

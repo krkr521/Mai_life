@@ -1187,8 +1187,8 @@
     document.getElementById('scene-text').textContent = sceneObj.scene || st.current_activity || '（当前时段暂无细化微场景描述）';
 
     const narEl = document.getElementById('scene-narrative-note');
-    if (sv.narrative_note) {
-      narEl.textContent = `⚠️ ${sv.narrative_note}`;
+    if (sv.narrative_note || (sv.maintenance_health && sv.maintenance_health !== '正常')) {
+      narEl.textContent = `⚠️ ${[sv.narrative_note, sv.maintenance_health !== '正常' ? sv.maintenance_health : ''].filter(Boolean).join(' · ')}`;
       narEl.style.color = 'var(--status-serious)';
     } else {
       narEl.textContent = `最新日记日期：${sv.diary_last_day || '暂无'} · 后台协程 ${sv.background_tasks ?? 0} 个`;

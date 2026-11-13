@@ -222,15 +222,8 @@ class GroupObserver:
         candidates=[]
         profiles={str(item.user_id):item for item in self.config.users.profiles if item.enabled}
         for user in await self.store.list_users(proactive_only=True):
-            uid=str(user["user_id"]); profile=profiles.get(uid)
-            role=str(user.get("role") or "friend")
-            # 群转私对主人是“全局开关 AND 档案开关”双条件；朋友仍只看个人档案开关。
-            if role=="owner":
-                allowed=bool(self.config.group.owner_group_to_private_enabled
-                             and profile and profile.group_to_private_enabled)
-            else:
-                allowed=bool(profile and profile.group_to_private_enabled)
-            if not allowed or not user.get("stream_id"):continue
+            uid=str(user["user_id"])
+            if not self.config.allows_group_share(profiles.get(uid),user.get("role")) or not user.get("stream_id"):continue
             activity=await self.store.get_group_activity(observation["group_id"],uid)
             # 未知活跃时间不等于已离群；必须有一次真实群活跃作为保守证据。
             last_active=float(activity.get("last_active_at") or 0)
@@ -238,7 +231,8 @@ class GroupObserver:
             stats=await self.store.social_share_stats(uid,day_start)
             if stats["count"]>=int(self.config.group.group_share_daily_max):continue
             if stats["last_at"] and now.timestamp()-stats["last_at"]<int(self.config.group.group_share_min_interval_minutes)*60:continue
-            candidates.append((float(user.get("temperature") or 0),last_active,user))
+            from ..core.relationship_bridge import relationship_weight
+            candidates.append((relationship_weight(user,self.config.context.relationship_enabled),last_active,user))
         if not candidates:return False
         # 同一群话题只选择一位最合适的用户，避免把相同内容复制到多个私聊。
         candidates.sort(key=lambda item:(item[0],-item[1]),reverse=True); user=candidates[0][2]

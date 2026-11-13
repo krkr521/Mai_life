@@ -27,23 +27,21 @@
 {"capabilities": ["api.call"]}
 ```
 
-三个接口都是公开 API（`public=True`），经 SDK 的 `ctx.api.call` 按名调用，参数作为关键字参数透传：
+三个接口都是公开 API（`public=True`）。用 SDK 的 `ctx.api.call` 按名调用，并以关键字参数传入查询条件。
 
 ```python
 async def read_schedule(ctx):
-    response = await ctx.api.call(
+    result = await ctx.api.call(
         "maibot-community.mai-life.get_schedule_snapshot",
         version="1",
         future_limit=3,
     )
-    if response["success"] is not True:
-        raise RuntimeError(response["error"])   # RPC 层失败（接口不存在/版本不符等）
-    envelope = response["result"]               # 业务信封，见下一节
-    if envelope["success"]:
-        current = envelope["data"]["current"]   # 当前活动（可能为 null）
+    if result["success"] is not True:
+        raise RuntimeError(result["error"])
+    current = result["data"]["current"]  # 当前活动（可能为 null）
 ```
 
-`response["success"]` 是 Host 的 RPC 层结果；业务结果在 `response["result"]` 里，是下述信封。业务失败不会抛异常，一律走信封返回——不要用 try/except 判断业务错误。
+`ctx.api.call` 在转发成功时直接返回下述业务信封。接口不存在、版本不符等宿主转发失败同样通过 `success=false` 和 `error` 表示。
 
 ## 返回信封
 

@@ -56,7 +56,7 @@ proactive_enabled = false
 role = "friend"
 
 # 明确填写 0～20；0 禁止主动，朋友通常为 1，主人通常为 2。
-daily_proactive_max = 1
+daily_proactive_max = 5
 
 # 首次创建档案时的关系温度，范围 0～100。推荐保持 30。
 initial_temperature = 30
@@ -74,7 +74,7 @@ group_to_private_enabled = false
 # enabled = true
 # proactive_enabled = true
 # role = "owner"
-# daily_proactive_max = 2
+# daily_proactive_max = 5
 # initial_temperature = 30
 # quiet_start = "00:00"
 # quiet_end = "08:00"
@@ -229,7 +229,11 @@ nap_start = "12:00"
 nap_end = "14:30"
 
 [context]
+relationship_provider = "internal"
+outreach_feedback_enabled = false
 enabled = true
+# 已有“身份认知＋印象卡片”时关闭本插件关系系统，生活背景仍生效。
+relationship_enabled = true
 continuity_enabled = true
 continuity_interval_minutes = 10
 owner_only_terms = ["主人", "老公", "老婆", "亲爱的主人"]
@@ -267,6 +271,8 @@ retention_days = 30
 
 
 [schedule]
+semantic_dedup_enabled = false
+semantic_history_days = 3
 # 每天强制重新生成生活框架的小时，范围 0～23。
 # 插件首次启动且缺少当日日程时仍会立即生成。
 generate_hour = 3
@@ -277,6 +283,10 @@ detail_lead_minutes = 60
 # 日程骨架模板，相对于插件目录。普通用户通常无需修改。
 template_file = "mai_template.json"
 
+# 从独立 AniTabi 插件读取原作取景地点，供现实外出活动选用。
+anitabi_locations = false
+anitabi_subject_id = 0
+
 
 [proactive]
 # 主动私聊总开关。关闭后仍会维护生活状态和日程。
@@ -285,8 +295,8 @@ enabled = true
 # 检查主动契机的间隔，范围 1～60 分钟。
 patrol_interval_minutes = 10
 
-# 同一用户两次主动消息之间的最小间隔，单位分钟。
-min_interval_minutes = 180
+# 发话节奏按 [users] 中各自的 daily_proactive_max 和清醒时长安排。
+# 每个用户在同一段睡眠最多收到一次主动私聊，个人免打扰优先。
 
 # 用户刚发言后多久不再主动开新话题，单位分钟。
 recent_user_silence_minutes = 30

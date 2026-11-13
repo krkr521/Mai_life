@@ -902,12 +902,16 @@
               <div style="font-family:var(--ml-font-mono);font-size:11.5px;color:var(--ml-muted);">QQ: ${esc(u.user_id)}</div>
             </div>
             <div style="display:flex;gap:5px;flex-wrap:wrap;">
-              <span class="ml-badge ${isOwner ? 'ml-badge-owner' : ''}">${isOwner ? '★ 主人 owner' : '朋友 friend'}</span>
+              <span class="ml-badge ${isOwner ? 'ml-badge-owner' : ''}">${esc(u.stage || (isOwner ? '主人' : '朋友'))}</span>
               <span class="ml-badge ${u.enabled ? 'ml-badge-good' : ''}">${u.enabled ? '已启用' : '已禁用'}</span>
             </div>
           </div>
 
-          <div>
+          ${u.relationship_source === 'impression_card+identity' ? `<div style="font-size:12px;color:var(--ml-muted)">
+            ${u.relationship_ready ? `印象卡片好感：<strong>${u.affinity == null ? '尚未建档' : esc(u.affinity)}</strong>
+            （参考刻度 ${esc(u.affinity_scale_min ?? '未知')}～${esc(u.affinity_scale_max ?? '未知')}，数值可越界）；
+            身份来源：${u.role_source === 'manual' ? '手动名单' : '动态关系'}` : `身份接口不可用：${esc(u.relationship_error || '状态未知')}`}
+          </div>` : u.relationship_enabled === false ? '<div style="font-size:12px;color:var(--ml-muted)">关系由印象卡片与身份认知统一管理；此处仅维护隐私档案与主动额度。</div>' : `<div>
             <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
               <span>关系阶段：<strong>${esc(u.stage || '未知')}</strong></span>
               <span style="font-variant-numeric:tabular-nums;">温度 <strong>${temp.toFixed(1)}°</strong> ${!isOwner ? '<small style="color:var(--ml-muted)">(上限 80°)</small>' : ''}</span>
@@ -916,7 +920,7 @@
               <div class="ml-temp-bar-fill" style="width:${temp.toFixed(1)}%;"></div>
               ${!isOwner ? '<div class="ml-temp-cap-pin" title="朋友关系温度封顶线 (80)"></div>' : ''}
             </div>
-          </div>
+          </div>`}
 
           <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--ml-muted);">
             <span>今日主动额度 (${u.proactive_enabled ? '开启' : '关闭'})</span>

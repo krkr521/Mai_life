@@ -5,7 +5,11 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, replace
+from html import escape
 from typing import Any, Iterator, Mapping
+
+import base64
+import hashlib
 
 
 PLUGIN_ID = "maibot-community.mai-life"
@@ -79,6 +83,52 @@ def _iter_context_texts(payload: Any) -> Iterator[str]:
                         yield text
         else:
             yield _content_text(message.get("content"))
+
+
+_PLANNER_MESSAGE_END_RE = re.compile(r'\n<message msg_id="([^"\r\n]+)" user="[^"\r\n]*" boundary="end" />\s*$')
+
+
+def planner_includes_private_message(payload: Any, message_id: str) -> bool:
+    """核对 Planner 里最新的真实来信，同时排除排在来信之后的插件主动任务。"""
+    if not message_id or not isinstance(payload, list):
+        return False
+    # 与宿主的长消息 ID 显示规则一致。普通 QQ 数字 ID 保持原样。
+    display_id = message_id
+    if len(display_id) > 12:
+        digest = hashlib.sha1(display_id.encode("utf-8")).digest()
+        display_id = "m" + base64.b32encode(digest).decode("ascii").lower()[:6]
+    for item in reversed(payload):
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("item_type") == "UserMessageItem":
+            parts = item.get("parts")
+            text = _content_text(parts[-1]) if isinstance(parts, list) and parts else ""
+        elif item.get("role") == "user":
+            text = _content_text(item.get("content"))
+        else:
+            continue
+        if _TASK_BLOCK_RE.match(text.lstrip()):
+            return False
+        match = _PLANNER_MESSAGE_END_RE.search(text)
+        if match:
+            return match[1] == escape(display_id, quote=True)
+    return False
+
+
+def planner_has_message_reference(payload: Any, message_id: str) -> bool:
+    """只检查历史引用是否仍在当前Planner上下文中，不用于当前来信授权或勿扰令牌。"""
+    if not message_id or not isinstance(payload,list):return False
+    display_id=message_id
+    if len(display_id)>12:
+        digest=hashlib.sha1(display_id.encode("utf-8")).digest()
+        display_id="m"+base64.b32encode(digest).decode("ascii").lower()[:6]
+    user_items=[item for item in payload if isinstance(item,Mapping)
+                and (item.get("item_type")=="UserMessageItem" or item.get("role")=="user")]
+    for text in _iter_context_texts(user_items):
+        if _TASK_BLOCK_RE.match(text.lstrip()):continue
+        match=_PLANNER_MESSAGE_END_RE.search(text)
+        if match and match[1]==escape(display_id,quote=True):return True
+    return False
 
 
 def latest_plugin_task_marker(payload: Any) -> PluginTaskMarker | None:
@@ -320,15 +370,14 @@ class ActiveTaskRegistry:
     def planner_instruction(task: ActivePluginTask, recent_message_id: str = "") -> str:
         """主动任务约束：有真实入站消息 ID 时只认它，任务编号绝不是 msg_id。
 
-        宿主 reply 内置工具的 find_source_message_by_id 查不到 proactive:xxx 任务编号，
-        且 to_display_message_id 会把锚点哈希成 7 位乱码，模型看不懂报错会反复重试，
-        因此必须显式禁止把任务编号当 msg_id；取不到真实消息（空会话）时才退回旧措辞。
+        宿主 reply 内置工具只支持真实消息，取不到明确锚点时由 Planner 参考目标会话历史。
         """
         if recent_message_id:
             anchor=(f"当前主动任务编号是 {task.task_id}，它只是插件内部编号、不是消息 ID，"
                     "宿主 reply 工具无法识别，不要把它当作 msg_id，用了会报无法理解的错误。"
                     f"若决定调用 reply，请把 msg_id 设为 {recent_message_id}"
-                    "（这是目标会话最近一条真实用户消息），"
+                    "（这是目标会话已核验的真实来信，仅用来定位会话，不代表对方刚发了新消息），"
+                    "本轮按当前主动契机和对方近况考虑开场，不重答旧消息内容；"
                     "不要改为较早的用户消息或 Bot 自己刚发出的消息。")
         else:
             # Issue #25：无真实消息锚点时绝不能再推荐把任务编号当 msg_id——
@@ -338,6 +387,9 @@ class ActiveTaskRegistry:
                     "不要把任务编号当作 msg_id（宿主无法识别、必然报错），也不要编造消息号。")
         return (
             "\n【Mai_life 主动任务约束】\n"
-            f"{anchor}一次任务最多产生一轮可见发送；"
+            f"{anchor}"
+            +("新的主动任务可以在没有新来信时独立评估是否开场；此前选择等待不等于本轮禁言，"
+              "没有合适内容时仍可保持安静。" if task.kind=="proactive" else "")
+            +"一次任务最多产生一轮可见发送；"
             "发送后等待用户回应，不要自行解释或连续追发。插件仍会在本地按会话任务防重。\n"
         )

@@ -62,6 +62,7 @@ class LLMService:
         """解析具体任务覆盖与基础角色回退，最终返回 MaiBot 的模型任务名。"""
         models = self.config.models
         routes = {
+            "semantic_review": "decision",
             "fast": models.fast_task,
             "reasoning": models.reasoning_task,
             "creative": models.creative_task,
@@ -89,6 +90,7 @@ class LLMService:
     def _active_task_kinds(self) -> set[str]:
         """只检查当前启用功能会实际调用的任务，fallback 不因此阻止插件启动。"""
         kinds={"schedule","scene_detail"}
+        if self.config.schedule.semantic_dedup_enabled:kinds.add("semantic_review")
         if self.config.context.enabled and self.config.context.continuity_enabled:kinds.add("continuity")
         if self.config.rest_gate.enabled and self.config.rest_gate.mode=="llm":kinds.add("rest_wakeup")
         if self.config.memory.enabled:
@@ -145,8 +147,8 @@ class LLMService:
 
     async def generate(self, prompt: str | list[dict[str, Any]], system: str = "", max_tokens: int = 0,
                        temperature: float = 0.5, *, task_kind: str = "reasoning",
-                       request_type: str = "generic") -> str:
-        """统一调用 Host 模型并记录插件侧用量；失败时返回空串供业务规则降级。
+                       request_type: str = "generic", raise_on_failure: bool = False) -> str:
+        """统一调用 Host 模型并记录插件侧用量；严格调用保留原始错误并抛出。
 
         max_tokens 传 0 表示用全局配置（models.max_output_tokens，默认 0=不限制）。
         """
@@ -164,6 +166,8 @@ class LLMService:
         started=time.perf_counter(); result:dict[str,Any]={}
         try:
             call_kwargs=self._generate_call(task,messages,temperature,self._output_limit(max_tokens))
+            if self.config.models.model_override and self._supports_task_name and task_kind!="semantic_review":
+                call_kwargs["model"]=self.config.models.model_override
             rpc_timeout=int(getattr(self.config.models,"llm_rpc_timeout_ms",0) or 0)
             if rpc_timeout>0 and task_kind in {"schedule","scene_detail"}:
                 # Issue #20：日程/场景细化的单次推理可能超过宿主默认 30s RPC 上限，
@@ -186,6 +190,9 @@ class LLMService:
         except Exception as exc:
             await self._record(result=result,task=task,request_type=request_type,started=started,success=False,error=str(exc))
             self.ctx.logger.warning(f"[MaiLife] LLM 调用失败 task={task} type={request_type}: {exc}")
+            if raise_on_failure:raise RuntimeError(f"{request_type} task={task}: {exc}") from exc
+            return ""
+        if raise_on_failure:raise RuntimeError(f"{request_type} task={task}: {failure_reason}")
         return ""
 
     async def generate_json(self, prompt: str, system: str, fallback: Any, max_tokens: int = 0,
@@ -196,7 +203,8 @@ class LLMService:
         raise_on_failure=True 时失败改为抛 RuntimeError，供调用方自行重试
         （默认 False 保持旧行为：失败返回 fallback 交业务规则降级）。
         """
-        raw=await self.generate(prompt,system,max_tokens=max_tokens,task_kind=task_kind,request_type=request_type)
+        raw=await self.generate(prompt,system,max_tokens=max_tokens,task_kind=task_kind,request_type=request_type,
+                                raise_on_failure=raise_on_failure)
         if not raw:
             if raise_on_failure:raise RuntimeError("LLM 调用失败或返回为空")
             return fallback

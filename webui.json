@@ -31,6 +31,15 @@
         "usage": {
           "api": "webui_usage",
           "version": "1"
+        },
+        "semantic_probe": {
+          "api": "webui_semantic_probe",
+          "version": "1",
+          "parameters": {
+            "candidate": {"type": "string", "required": true, "max_length": 6000},
+            "history_json": {"type": "string", "required": true, "max_length": 16000},
+            "kind": {"type": "string", "required": true, "choices": ["daily_schedule", "scene_detail", "proactive_message"]}
+          }
         }
       }
     },
